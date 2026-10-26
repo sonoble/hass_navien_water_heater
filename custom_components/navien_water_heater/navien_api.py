@@ -246,9 +246,9 @@ class NavilinkConnect():
         await self.async_subscribe(topic=self.topics.channel_status_res(),callback=self.handle_channel_status)
         await self.async_subscribe(topic=self.topics.connection(),callback=self.handle_other)
         await self.async_subscribe(topic=self.topics.disconnect(),callback=self.handle_other)
+        await self.async_subscribe(topic=self.topics.weekly_schedule_sub(),callback=self.handle_other)
+        await self.async_subscribe(topic=self.topics.weekly_schedule_res(),callback=self.handle_weekly_schedule)
         if self.subscribe_all_topics:
-            await self.async_subscribe(topic=self.topics.weekly_schedule_sub(),callback=self.handle_other)
-            await self.async_subscribe(topic=self.topics.weekly_schedule_res(),callback=self.handle_weekly_schedule)
             await self.async_subscribe(topic=self.topics.simple_trend_sub(),callback=self.handle_other)
             await self.async_subscribe(topic=self.topics.simple_trend_res(),callback=self.handle_simple_trend)
             await self.async_subscribe(topic=self.topics.hourly_trend_sub(),callback=self.handle_other)
@@ -284,6 +284,17 @@ class NavilinkConnect():
         channel = self.channels.get(channel_number,{})
         topic = self.topics.channel_status_req()
         payload = self.messages.channel_status(channel.channel_number,channel.channel_info.get("unitCount",1))
+        session_id = self.get_session_id()
+        payload["sessionID"] = session_id
+        self.response_events[session_id] = asyncio.Event()
+        await self.async_publish(topic=topic,payload=payload,session_id=session_id)
+
+    async def _get_weekly_schedule(self,channel_number):
+        """Request the weekly schedule from the device and wait for the response."""
+        channel = self.channels.get(channel_number)
+        _LOGGER.info("Requesting weekly schedule: modelTypeCode=%s weeklyScheduleType=%s", self.messages.model_type_code, channel.channel_info.get("weeklyScheduleType") if channel else None)
+        topic = self.topics.weekly_schedule_req()
+        payload = self.messages.weekly_schedule(channel_number)
         session_id = self.get_session_id()
         payload["sessionID"] = session_id
         self.response_events[session_id] = asyncio.Event()
@@ -373,8 +384,22 @@ class NavilinkConnect():
     def handle_channel_status(self, client, userdata, message):
         self.loop.call_soon_threadsafe(self.async_handle_channel_status, client, userdata, message)
 
+    def async_handle_weekly_schedule(self, client, userdata, message):
+        _LOGGER.debug("Weekly schedule response: %s", message.payload.decode('utf-8'))
+        response = {}
+        try:
+            response = json.loads(message.payload)
+            schedule = response.get("response",{}).get("weeklySchedule",{})
+            channel = self.channels.get(schedule.get("channelNumber",0),None)
+            if channel is not None:
+                channel.update_weekly_schedule(schedule.get("channel",{}))
+        except Exception as e:
+            _LOGGER.warning("Unable to parse weekly schedule response: %s: %s", type(e).__name__, e)
+        if response_event := self._resolve_response_event(response.get("sessionID","unknown")):
+            response_event.set()
+
     def handle_weekly_schedule(self, client, userdata, message):
-        _LOGGER.info("WEEKLY SCHEDULE: " + message.payload.decode('utf-8') + '\n')
+        self.loop.call_soon_threadsafe(self.async_handle_weekly_schedule, client, userdata, message)
 
     def handle_simple_trend(self, client, userdata, message):
         _LOGGER.info("SIMPLE TREND: " + message.payload.decode('utf-8') + '\n')
@@ -399,6 +424,7 @@ class NavilinkChannel:
         self.hub = hub
         self.callbacks = []
         self.channel_status = {}
+        self.weekly_schedule = {}
         self.unit_list = {}
         self.waiting_for_response = False
 
@@ -417,6 +443,28 @@ class NavilinkChannel:
     def publish_update(self):
         if len(self.callbacks) > 0:
             [callback() for callback in self.callbacks]
+
+    async def get_weekly_schedule(self):
+        """Fetch the weekly schedule from the device and return it."""
+        await self.hub._get_weekly_schedule(self.channel_number)
+        return self.weekly_schedule
+
+    def update_weekly_schedule(self,schedule):
+        """Store a parsed weekly schedule.
+
+        The device encodes weeklySchdList (and each day's schdList) as JSON
+        strings inside the JSON payload; accept either strings or lists.
+        """
+        def load(value):
+            return json.loads(value) if isinstance(value,str) else (value or [])
+        days = []
+        for day in load(schedule.get("weeklySchdList",[])):
+            entries = [{"num":e.get("num"),"hour":e.get("hh"),"minute":e.get("mm"),"on":e.get("flag") == 1,**({"type":e["type"]} if "type" in e else {})} for e in load(day.get("schdList",[]))]
+            days.append({"day":day.get("day"),"entries":sorted(entries,key=lambda e:(e["hour"] or 0,e["minute"] or 0))})
+        self.weekly_schedule = {
+            "enabled": schedule.get("weeklyControl") == 1,
+            "days": days,
+        }
 
     async def set_power_state(self,state):
         if not self.waiting_for_response:
@@ -606,6 +654,7 @@ class Messages:
         self.mac_address = device_info.get("deviceInfo",{}).get("macAddress","")
         self.device_type = int(device_info.get("deviceInfo",{}).get("deviceType",1))
         self.additional_value = device_info.get("deviceInfo",{}).get("additionalValue","")   
+        self.model_type_code = device_info.get("deviceInfo",{}).get("modelTypeCode",0) or 0
         self.client_id = client_id
         self.topics = topics
 
@@ -626,6 +675,20 @@ class Messages:
             "request":{"additionalValue":self.additional_value,"command":16777220,"deviceType":self.device_type,"macAddress":self.mac_address,"status":{"channelNumber":channel_number,"unitNumberEnd":unit_count,"unitNumberStart":1}},
             "requestTopic": self.topics.channel_status_req(),
             "responseTopic": self.topics.channel_status_res(),
+            "sessionID": ""
+        }
+
+    def weekly_schedule(self, channel_number):
+        request = {"additionalValue":self.additional_value,"command":16777222,"deviceType":self.device_type,"macAddress":self.mac_address,"status":{"channelNumber":channel_number}}
+        if self.model_type_code:
+            # The mobile app only sends modelTypeCode for devices that report a nonzero one.
+            request["modelTypeCode"] = self.model_type_code
+        return {
+            "clientID": self.client_id,
+            "protocolVersion":1,
+            "request":request,
+            "requestTopic": self.topics.weekly_schedule_req(),
+            "responseTopic": self.topics.weekly_schedule_res(),
             "sessionID": ""
         }
 

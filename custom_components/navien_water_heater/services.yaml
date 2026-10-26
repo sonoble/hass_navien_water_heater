@@ -1,0 +1,3 @@
+get_weekly_schedule:
+  name: Get weekly schedule
+  description: Read the weekly (recirculation) schedule stored on the Navien water heater and return it. Read-only.

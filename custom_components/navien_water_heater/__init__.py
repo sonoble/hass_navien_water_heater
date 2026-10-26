@@ -1,7 +1,7 @@
 """The Navien NaviLink Water Heater Integration."""
 from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from .navien_api import (
     NavilinkConnect
 )
@@ -11,6 +11,18 @@ import os
 _LOGGER=logging.getLogger(__name__)
 
 PLATFORMS: list[str] = ["water_heater","sensor","switch"]
+
+SERVICE_GET_WEEKLY_SCHEDULE = "get_weekly_schedule"
+
+async def _async_get_weekly_schedule(hass: HomeAssistant, call: ServiceCall) -> dict:
+    """Read the weekly schedule from every channel of every configured device."""
+    result = {}
+    for entry_id, navilink in hass.data.get(DOMAIN, {}).items():
+        result[entry_id] = {
+            str(number): await channel.get_weekly_schedule()
+            for number, channel in navilink.channels.items()
+        }
+    return result
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Navien NaviLink Water Heater Integration from a config entry."""
@@ -24,6 +36,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = navilink
     await navilink.start()    
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    if not hass.services.has_service(DOMAIN, SERVICE_GET_WEEKLY_SCHEDULE):
+        async def get_weekly_schedule(call: ServiceCall) -> dict:
+            return await _async_get_weekly_schedule(hass, call)
+        hass.services.async_register(DOMAIN, SERVICE_GET_WEEKLY_SCHEDULE, get_weekly_schedule, supports_response=SupportsResponse.ONLY)
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -33,5 +49,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
+        if not hass.data[DOMAIN]:
+            hass.services.async_remove(DOMAIN, SERVICE_GET_WEEKLY_SCHEDULE)
     return unload_ok
 
