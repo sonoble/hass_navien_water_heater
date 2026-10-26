@@ -14,6 +14,9 @@ _LOGGER = logging.getLogger(__name__)
 # interval (twice). Responses normally arrive in 1-3 seconds.
 RESPONSE_TIMEOUT = 10
 
+# The device accepts at most this many schedule entries per day.
+MAX_SCHEDULE_ENTRIES_PER_DAY = 10
+
 class NavilinkConnect():
 
     # The Navien server.
@@ -300,6 +303,22 @@ class NavilinkConnect():
         self.response_events[session_id] = asyncio.Event()
         await self.async_publish(topic=topic,payload=payload,session_id=session_id)
 
+    async def _write_weekly_schedule(self,channel_number,enabled,days):
+        """Send a complete weekly schedule to the device, then read it back.
+
+        The device has no per-entry edit: every write replaces the whole
+        schedule, so callers must pass the full list of days.
+        """
+        topic = self.topics.control()
+        payload = self.messages.set_weekly_schedule(channel_number, enabled, days)
+        session_id = self.get_session_id()
+        payload["sessionID"] = session_id
+        self.response_events[session_id] = asyncio.Event()
+        _LOGGER.info("Writing weekly schedule (enabled=%s): %s", enabled, json.dumps(days,separators=(',',':')))
+        await self.async_publish(topic=topic,payload=payload,session_id=session_id)
+        await self._get_weekly_schedule(channel_number)
+        await self._get_channel_status(channel_number)
+
     async def _power_command(self,state,channel_number):
         state_num = 2
         if state:
@@ -391,8 +410,8 @@ class NavilinkConnect():
             response = json.loads(message.payload)
             schedule = response.get("response",{}).get("weeklySchedule",{})
             channel = self.channels.get(schedule.get("channelNumber",0),None)
-            if channel is not None:
-                channel.update_weekly_schedule(schedule.get("channel",{}))
+            if channel is not None and "weeklySchdList" in schedule.get("channel",{}):
+                channel.update_weekly_schedule(schedule["channel"])
         except Exception as e:
             _LOGGER.warning("Unable to parse weekly schedule response: %s: %s", type(e).__name__, e)
         if response_event := self._resolve_response_event(response.get("sessionID","unknown")):
@@ -425,6 +444,7 @@ class NavilinkChannel:
         self.callbacks = []
         self.channel_status = {}
         self.weekly_schedule = {}
+        self.weekly_days_raw = []
         self.unit_list = {}
         self.waiting_for_response = False
 
@@ -445,8 +465,59 @@ class NavilinkChannel:
             [callback() for callback in self.callbacks]
 
     async def get_weekly_schedule(self):
-        """Fetch the weekly schedule from the device and return it."""
+        """Fetch the weekly schedule from the device and return it.
+
+        The cached schedule is cleared first, so an empty result means the
+        device did not answer rather than that an old value is still cached.
+        """
+        self.weekly_schedule = {}
+        self.weekly_days_raw = []
         await self.hub._get_weekly_schedule(self.channel_number)
+        return self.weekly_schedule
+
+    async def set_weekly_control(self,enabled):
+        """Turn the weekly schedule as a whole on or off, keeping its entries."""
+        await self.get_weekly_schedule()
+        if not self.weekly_schedule:
+            raise NoResponseData("Could not read the current weekly schedule; not changing it")
+        if self.is_available():
+            await self.hub._write_weekly_schedule(self.channel_number,enabled,self.weekly_days_raw)
+
+    async def set_weekly_schedule(self,days,enabled=None):
+        """Replace the entries for the given days, leaving other days untouched.
+
+        :param days: list of {"day": 1-7 (1=Sunday), "entries": [{"hour","minute","on"}]}.
+                     An empty entries list clears that day.
+        :param enabled: new on/off state of the schedule, or None to keep it.
+        """
+        updates = {}
+        for day in days:
+            number = day["day"]
+            if number not in range(1,8):
+                raise ValueError(f"day must be 1 (Sunday) to 7 (Saturday), got {number}")
+            entries = sorted(day.get("entries",[]),key=lambda e:(e["hour"],e["minute"]))
+            if len(entries) > MAX_SCHEDULE_ENTRIES_PER_DAY:
+                raise ValueError(f"day {number} has {len(entries)} entries; the maximum is {MAX_SCHEDULE_ENTRIES_PER_DAY}")
+            schd = []
+            for num,entry in enumerate(entries,start=1):
+                if entry["hour"] not in range(24) or entry["minute"] not in range(60):
+                    raise ValueError(f"invalid time {entry['hour']}:{entry['minute']} on day {number}")
+                schd.append({"num":num,"hh":entry["hour"],"mm":entry["minute"],"flag":1 if entry["on"] else 2})
+            updates[number] = schd
+
+        await self.get_weekly_schedule()
+        if not self.weekly_schedule:
+            raise NoResponseData("Could not read the current weekly schedule; not changing it")
+        _LOGGER.info("Weekly schedule before change: %s", json.dumps(self.weekly_days_raw,separators=(',',':')))
+        merged = {d["day"]:d for d in self.weekly_days_raw}
+        for number,schd in updates.items():
+            if schd:
+                merged[number] = {"day":number,"schdCnt":len(schd),"schdList":schd}
+            else:
+                merged.pop(number,None)
+        if enabled is None:
+            enabled = self.weekly_schedule["enabled"]
+        await self.hub._write_weekly_schedule(self.channel_number,enabled,[merged[k] for k in sorted(merged)])
         return self.weekly_schedule
 
     def update_weekly_schedule(self,schedule):
@@ -458,9 +529,14 @@ class NavilinkChannel:
         def load(value):
             return json.loads(value) if isinstance(value,str) else (value or [])
         days = []
+        raw_days = []
         for day in load(schedule.get("weeklySchdList",[])):
-            entries = [{"num":e.get("num"),"hour":e.get("hh"),"minute":e.get("mm"),"on":e.get("flag") == 1,**({"type":e["type"]} if "type" in e else {})} for e in load(day.get("schdList",[]))]
+            raw_entries = load(day.get("schdList",[]))
+            if raw_entries:
+                raw_days.append({"day":day.get("day"),"schdCnt":len(raw_entries),"schdList":raw_entries})
+            entries = [{"num":e.get("num"),"hour":e.get("hh"),"minute":e.get("mm"),"on":e.get("flag") == 1,**({"type":e["type"]} if "type" in e else {})} for e in raw_entries]
             days.append({"day":day.get("day"),"entries":sorted(entries,key=lambda e:(e["hour"] or 0,e["minute"] or 0))})
+        self.weekly_days_raw = raw_days
         self.weekly_schedule = {
             "enabled": schedule.get("weeklyControl") == 1,
             "days": days,
@@ -688,6 +764,19 @@ class Messages:
             "protocolVersion":1,
             "request":request,
             "requestTopic": self.topics.weekly_schedule_req(),
+            "responseTopic": self.topics.weekly_schedule_res(),
+            "sessionID": ""
+        }
+
+    def set_weekly_schedule(self, channel_number, enabled, days):
+        request = {"additionalValue":self.additional_value,"command":33554438,"control":{"channelNumber":channel_number,"weeklyControl":1 if enabled else 2,"weeklyScheduleList":days},"deviceType":self.device_type,"macAddress":self.mac_address}
+        if self.model_type_code:
+            request["modelTypeCode"] = self.model_type_code
+        return {
+            "clientID": self.client_id,
+            "protocolVersion":1,
+            "request":request,
+            "requestTopic": self.topics.control(),
             "responseTopic": self.topics.weekly_schedule_res(),
             "sessionID": ""
         }

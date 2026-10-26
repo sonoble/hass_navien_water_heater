@@ -1,3 +1,33 @@
 get_weekly_schedule:
   name: Get weekly schedule
   description: Read the weekly (recirculation) schedule stored on the Navien water heater and return it. Read-only.
+
+set_weekly_schedule:
+  name: Set weekly schedule
+  description: >-
+    Replace the on/off entries for the given days of the weekly schedule. Days
+    you do not list are left unchanged; an empty entries list clears a day. The
+    device stores at most 10 entries per day. The current schedule is logged
+    before it is changed.
+  fields:
+    channel:
+      name: Channel
+      description: Channel number, if the account has more than one.
+      selector:
+        number:
+          min: 1
+          max: 8
+    enabled:
+      name: Schedule enabled
+      description: Turn the schedule on or off at the same time. Omit to keep the current state.
+      selector:
+        boolean:
+    days:
+      name: Days
+      description: >-
+        List of days, each {day: 1-7 (1 = Sunday), entries: [{hour: 0-23,
+        minute: 0-59, on: true|false}]}.
+      required: true
+      example: '[{"day": 2, "entries": [{"hour": 7, "minute": 0, "on": true}, {"hour": 9, "minute": 0, "on": false}]}]'
+      selector:
+        object:

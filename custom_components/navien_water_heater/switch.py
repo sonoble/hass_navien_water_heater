@@ -18,7 +18,8 @@ async def async_setup_entry(
     for channel in navilink.channels.values():
         if channel.channel_info.get("onDemandUse",2) == 1:
             devices.append(NavienOnDemandSwitchEntity(navilink, channel))
-        devices.append(NavienPowerSwitchEntity(navilink, channel))        
+        devices.append(NavienPowerSwitchEntity(navilink, channel))
+        devices.append(NavienScheduleSwitchEntity(navilink, channel))
     async_add_entities(devices)
 
 
@@ -127,3 +128,61 @@ class NavienPowerSwitchEntity(SwitchEntity):
     async def async_turn_off(self):
         """Turn Off Power."""
         await self.channel.set_power_state(False)
+
+
+class NavienScheduleSwitchEntity(SwitchEntity):
+    """Define a Weekly Schedule Switch Entity.
+
+    Turns the heater's built-in weekly schedule on or off as a whole. The
+    schedule entries themselves are kept; use the set_weekly_schedule service
+    to change them.
+    """
+
+    def __init__(self, navilink, channel):
+        self.navilink = navilink
+        self.channel = channel
+
+    async def async_added_to_hass(self) -> None:
+        """Run when this Entity has been added to HA."""
+        self.channel.register_callback(self.async_write_ha_state)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Entity being removed from hass."""
+        self.channel.deregister_callback(self.async_write_ha_state)
+
+    @property
+    def available(self):
+        """Return if the the device is online or not."""
+        return self.channel.is_available()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device registry information for this entity."""
+        return DeviceInfo(
+            identifiers = {(DOMAIN, self.navilink.device_info.get("deviceInfo",{}).get("macAddress","unknown") + "_" + str(self.channel.channel_number))},
+            manufacturer = "Navien",
+            name = self.navilink.device_info.get("deviceInfo",{}).get("deviceName","unknown") + " CH" + str(self.channel.channel_number)
+        )
+
+    @property
+    def name(self):
+        """Return the name of the entity."""
+        return self.navilink.device_info.get("deviceInfo",{}).get("deviceName","UNKNOWN") + " Schedule CH" + str(self.channel.channel_number)
+
+    @property
+    def unique_id(self):
+        """Return the unique ID of the entity."""
+        return self.navilink.device_info.get("deviceInfo",{}).get("macAddress","unknown") + str(self.channel.channel_number) + "weekly_schedule"
+
+    @property
+    def is_on(self):
+        """Return whether the weekly schedule is enabled."""
+        return self.channel.channel_status.get("weeklyControl") == 1
+
+    async def async_turn_on(self):
+        """Enable the weekly schedule."""
+        await self.channel.set_weekly_control(True)
+
+    async def async_turn_off(self):
+        """Disable the weekly schedule."""
+        await self.channel.set_weekly_control(False)
