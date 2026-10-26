@@ -1,0 +1,77 @@
+# "Hot water now": a virtual hot button for Navien units that start a warm-up
+# when the weekly schedule is switched off (observed on an NPE-240A-NG).
+#
+# Requires this integration's "<device name> Schedule CH<n>" switch and
+# Home Assistant 2024.10 or newer (uses `action:` and `triggers:`).
+#
+# Before use, replace the entity id below with your own (Settings > Devices >
+# your Navien > Schedule switch). It is defined in two places.
+#
+# Each press writes your full schedule to the heater twice (off, then on).
+
+# --- scripts.yaml (or Settings > Automations & Scenes > Scripts > YAML) ---
+hot_water_now:
+  alias: Hot water now
+  icon: mdi:shower-head
+  mode: single            # a second press during the wait is ignored
+  max_exceeded: silent
+  fields:
+    minutes:
+      name: Minutes to leave the schedule off
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 15
+  variables:
+    schedule_switch: switch.navien_schedule_ch2   # <-- change me
+    wait_minutes: "{{ minutes | default(5) | int }}"
+  sequence:
+    # If the schedule is already off, someone is managing it by hand; leave it alone.
+    - condition: template
+      value_template: "{{ is_state(schedule_switch, 'on') }}"
+    - action: switch.turn_off
+      target:
+        entity_id: "{{ schedule_switch }}"
+    - delay:
+        minutes: "{{ wait_minutes }}"
+    # Always put the schedule back, retrying if the heater connection hiccups.
+    - repeat:
+        until: "{{ is_state(schedule_switch, 'on') or repeat.index >= 5 }}"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: "{{ schedule_switch }}"
+            continue_on_error: true
+          - delay:
+              seconds: 15
+    - if:
+        - condition: template
+          value_template: "{{ not is_state(schedule_switch, 'on') }}"
+      then:
+        - action: persistent_notification.create
+          data:
+            title: Navien schedule is still OFF
+            message: >-
+              Hot water now could not switch the schedule back on. Turn on
+              {{ schedule_switch }} (or Weekly Set in the Navilink app).
+
+# --- automations.yaml: safety net if the script never got to switch it back on ---
+- alias: Navien schedule safety net
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: switch.navien_schedule_ch2     # <-- change me
+      to: "off"
+      for: "00:15:00"
+    - trigger: time_pattern
+      minutes: "/30"     # also catches a restart while the schedule was off
+  conditions:
+    - condition: state
+      entity_id: switch.navien_schedule_ch2     # <-- change me
+      state: "off"
+      for: "00:15:00"
+  actions:
+    - action: switch.turn_on
+      target:
+        entity_id: switch.navien_schedule_ch2  # <-- change me
