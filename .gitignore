@@ -1,0 +1,4 @@
+.venv/
+schedule-backup-*.json
+__pycache__/
+status-*.json
